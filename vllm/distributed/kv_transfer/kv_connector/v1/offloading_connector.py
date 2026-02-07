@@ -450,6 +450,13 @@ class OffloadingConnectorScheduler:
             self._reqs_to_load[req_id].append((group_id, (src_spec, dst_spec)))
             req_blocks_being_loaded.update(block_hashes)
             self._next_stored_block_idx[req_id][group_id] = num_blocks
+            logger.debug(
+                "Request %s group %s loading %s blocks (gpu blocks: %s)",
+                req_id,
+                group_id,
+                len(block_hashes),
+                len(block_ids[num_computed_gpu_blocks:]),
+            )
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(req_blocks_being_loaded)

@@ -477,7 +477,9 @@ class OffloadingConnectorScheduler:
             for group_id in range(self.num_kv_cache_groups):
                 block_ids = self._request_block_ids[req_id][group_id]
                 start_block_idx = self._next_stored_block_idx[req_id][group_id]
-                num_new_blocks = num_blocks - start_block_idx
+                max_blocks = len(block_ids) // self.block_size_factor
+                effective_num_blocks = min(num_blocks, max_blocks)
+                num_new_blocks = effective_num_blocks - start_block_idx
 
                 if num_new_blocks <= 0:
                     continue
@@ -486,7 +488,10 @@ class OffloadingConnectorScheduler:
                 # len(req.block_hashes) < num_blocks * self.block_size_factor.
 
                 new_block_hashes = self._get_group_block_hashes(
-                    req, group_id, start_idx=start_block_idx, end_idx=num_blocks
+                    req,
+                    group_id,
+                    start_idx=start_block_idx,
+                    end_idx=effective_num_blocks,
                 )
                 store_output = self.manager.prepare_store(new_block_hashes)
                 if store_output is None:
@@ -498,19 +503,22 @@ class OffloadingConnectorScheduler:
                     )
                     continue
 
-                self._next_stored_block_idx[req_id][group_id] = num_blocks
+                self._next_stored_block_idx[req_id][group_id] = effective_num_blocks
 
                 if not store_output.block_hashes_to_store:
                     continue
                 block_hashes_to_store = set(store_output.block_hashes_to_store)
 
                 block_hashes = self._get_group_block_hashes(
-                    req, group_id, end_idx=num_blocks
+                    req, group_id, end_idx=effective_num_blocks
                 )
                 self.manager.touch(block_hashes)
 
                 new_block_hashes = self._get_group_block_hashes(
-                    req, group_id, start_idx=start_block_idx, end_idx=num_blocks
+                    req,
+                    group_id,
+                    start_idx=start_block_idx,
+                    end_idx=effective_num_blocks,
                 )
                 dst_spec = store_output.store_spec
                 src_block_ids: list[int] = []

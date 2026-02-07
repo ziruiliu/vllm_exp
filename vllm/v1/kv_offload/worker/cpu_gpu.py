@@ -10,6 +10,7 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
@@ -77,6 +78,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         dst_tensors: list[torch.Tensor],
         src_block_size_factor: int,
         dst_block_size_factor: int,
+        group_tensor_indices: dict[int, list[int]] | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -103,6 +105,18 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             for tensor in src_tensors
         ]
         self.total_block_size_in_bytes = sum(self.block_size_in_bytes)
+        self.group_tensor_indices = group_tensor_indices
+        if self.group_tensor_indices is not None:
+            self.group_total_block_size_in_bytes = {
+                group_id: sum(
+                    self.block_size_in_bytes[idx]
+                    for idx in tensor_indices
+                    if idx < len(self.block_size_in_bytes)
+                )
+                for group_id, tensor_indices in self.group_tensor_indices.items()
+            }
+        else:
+            self.group_total_block_size_in_bytes = None
 
         assert len(src_tensors) > 0
         self.gpu_to_cpu: bool = self.src_tensors[0].is_cuda
@@ -164,17 +178,38 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             stream.wait_event(last_event)
         with torch.cuda.stream(stream):
             start_event.record(stream)
-            for src_tensor, dst_tensor, block_size_in_bytes in zip(
-                self.src_tensors,
-                self.dst_tensors,
-                self.block_size_in_bytes,
-            ):
-                ops.swap_blocks(
-                    src_tensor,
-                    dst_tensor,
-                    block_size_in_bytes,
-                    src_to_dst_tensor,
+            group_id = getattr(src_spec, "group_id", None)
+            if group_id is None:
+                group_id = getattr(dst_spec, "group_id", None)
+            if group_id is not None and self.group_tensor_indices is not None:
+                tensor_indices = self.group_tensor_indices.get(group_id)
+                assert tensor_indices is not None, (
+                    "No tensors registered for group_id "
+                    f"{group_id}; cannot execute transfer."
                 )
+                for idx in tensor_indices:
+                    ops.swap_blocks(
+                        self.src_tensors[idx],
+                        self.dst_tensors[idx],
+                        self.block_size_in_bytes[idx],
+                        src_to_dst_tensor,
+                    )
+                total_block_size_in_bytes = self.group_total_block_size_in_bytes.get(
+                    group_id, 0
+                )
+            else:
+                for src_tensor, dst_tensor, block_size_in_bytes in zip(
+                    self.src_tensors,
+                    self.dst_tensors,
+                    self.block_size_in_bytes,
+                ):
+                    ops.swap_blocks(
+                        src_tensor,
+                        dst_tensor,
+                        block_size_in_bytes,
+                        src_to_dst_tensor,
+                    )
+                total_block_size_in_bytes = self.total_block_size_in_bytes
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -184,7 +219,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 stream=stream,
                 start_event=start_event,
                 end_event=end_event,
-                num_bytes=dst_sub_block_count * self.total_block_size_in_bytes,
+                num_bytes=dst_sub_block_count * total_block_size_in_bytes,
             )
         )
 
@@ -228,9 +263,19 @@ class CpuGpuOffloadingHandlers:
         num_cpu_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
+        kv_cache_groups: list["KVCacheGroupSpec"] | None = None,
     ):
         assert gpu_caches
         assert cpu_block_size % gpu_block_size == 0
+
+        layer_to_group_id: dict[str, int] = {}
+        if kv_cache_groups:
+            layer_to_group_id = {
+                layer_name: group_id
+                for group_id, group in enumerate(kv_cache_groups)
+                for layer_name in group.layer_names
+            }
+        group_tensor_indices: dict[int, list[int]] = {}
 
         # find kernel block size and determine layout per each gpu tensor
         kernel_block_size: int | None = None
@@ -290,7 +335,9 @@ class CpuGpuOffloadingHandlers:
         logger.info("Allocating %d CPU tensors...", len(parsed_gpu_tensors))
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
-        for gpu_tensor, split_k_and_v in parsed_gpu_tensors:
+        for (layer_name, _), (gpu_tensor, split_k_and_v) in zip(
+            gpu_caches.items(), parsed_gpu_tensors
+        ):
             cpu_shape = list(gpu_tensor.shape)
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
 
@@ -302,14 +349,22 @@ class CpuGpuOffloadingHandlers:
                 pin_memory=pin_memory,
             )
 
-            gpu_tensors.extend(gpu_tensor.unbind(0) if split_k_and_v else [gpu_tensor])
-            cpu_tensors.extend(cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor])
+            group_id = layer_to_group_id.get(layer_name, 0)
+            gpu_parts = gpu_tensor.unbind(0) if split_k_and_v else [gpu_tensor]
+            cpu_parts = cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor]
+            start_idx = len(gpu_tensors)
+            gpu_tensors.extend(gpu_parts)
+            cpu_tensors.extend(cpu_parts)
+            group_tensor_indices.setdefault(group_id, []).extend(
+                range(start_idx, start_idx + len(gpu_parts))
+            )
 
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=gpu_tensors,
             dst_tensors=cpu_tensors,
             src_block_size_factor=gpu_block_size_factor,
             dst_block_size_factor=cpu_block_size_factor,
+            group_tensor_indices=group_tensor_indices,
         )
 
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
@@ -317,4 +372,5 @@ class CpuGpuOffloadingHandlers:
             dst_tensors=gpu_tensors,
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
+            group_tensor_indices=group_tensor_indices,
         )

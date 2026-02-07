@@ -102,6 +102,11 @@ class CPUOffloadingSpec(OffloadingSpec):
                 cpu_block_size=self.offloaded_block_size,
                 num_cpu_blocks=self.num_blocks,
                 gpu_caches=kv_caches,
+                kv_cache_groups=(
+                    self.kv_cache_config.kv_cache_groups
+                    if self.kv_cache_config is not None
+                    else None
+                ),
             )
 
         assert self._handlers is not None

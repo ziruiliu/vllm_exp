@@ -261,7 +261,8 @@ class CpuGpuOffloadingHandlers:
         gpu_block_size: int,
         cpu_block_size: int,
         num_cpu_blocks: int,
-        gpu_caches: dict[str, torch.Tensor],
+        gpu_caches: dict[str, torch.Tensor | list[torch.Tensor]
+                         | tuple[torch.Tensor, ...]],
         attn_backends: dict[str, type[AttentionBackend]],
         kv_cache_groups: list["KVCacheGroupSpec"] | None = None,
     ):
@@ -279,14 +280,30 @@ class CpuGpuOffloadingHandlers:
 
         # find kernel block size and determine layout per each gpu tensor
         kernel_block_size: int | None = None
-        # list of (gpu_tensor, split_k_and_v)
-        parsed_gpu_tensors: list[tuple[torch.Tensor, bool]] = []
+        # list of (layer_name, gpu_tensor, split_k_and_v)
+        parsed_gpu_tensors: list[tuple[str, torch.Tensor, bool]] = []
         for layer_name, gpu_tensor in gpu_caches.items():
+            tensors = (
+                list(gpu_tensor)
+                if isinstance(gpu_tensor, (list, tuple))
+                else [gpu_tensor]
+            )
+            for sub_tensor in tensors:
+                parsed_gpu_tensors.append((layer_name, sub_tensor, False))
+
+        parsed_layouts: list[tuple[str, torch.Tensor, bool]] = []
+        for layer_name, gpu_tensor, split_k_and_v in parsed_gpu_tensors:
             gpu_shape = gpu_tensor.shape
             attn_backend = attn_backends[layer_name]
-            test_shape = attn_backend.get_kv_cache_shape(
-                num_blocks=1234, block_size=16, num_kv_heads=8, head_size=256
-            )
+            try:
+                test_shape = attn_backend.get_kv_cache_shape(
+                    num_blocks=1234, block_size=16, num_kv_heads=8, head_size=256
+                )
+            except (AttributeError, NotImplementedError):
+                if kernel_block_size is None:
+                    kernel_block_size = gpu_block_size
+                parsed_layouts.append((layer_name, gpu_tensor, split_k_and_v))
+                continue
 
             has_layers_dim = False
             split_k_and_v = False
@@ -323,7 +340,7 @@ class CpuGpuOffloadingHandlers:
                 kernel_block_size = gpu_shape[block_size_idx]
                 assert gpu_block_size % kernel_block_size == 0
 
-            parsed_gpu_tensors.append((gpu_tensor, split_k_and_v))
+            parsed_layouts.append((layer_name, gpu_tensor, split_k_and_v))
 
         assert kernel_block_size is not None
         cpu_block_size_factor = cpu_block_size // kernel_block_size
@@ -332,12 +349,10 @@ class CpuGpuOffloadingHandlers:
 
         # allocate cpu tensors
         pin_memory = is_pin_memory_available()
-        logger.info("Allocating %d CPU tensors...", len(parsed_gpu_tensors))
+        logger.info("Allocating %d CPU tensors...", len(parsed_layouts))
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
-        for (layer_name, _), (gpu_tensor, split_k_and_v) in zip(
-            gpu_caches.items(), parsed_gpu_tensors
-        ):
+        for layer_name, gpu_tensor, split_k_and_v in parsed_layouts:
             cpu_shape = list(gpu_tensor.shape)
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
 
